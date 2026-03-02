@@ -1,0 +1,573 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import h5py
+import warnings
+warnings.filterwarnings('ignore')
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV, ParameterGrid
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from xgboost import XGBRegressor
+import joblib
+
+path = "/content/drive/MyDrive/ujikom/DATA/RICO_Acquisition_5_05-2024.hdf"
+
+try:
+    # Membaca file HDF5 secara otomatis dengan Pandas
+    df = pd.read_hdf(path)
+except Exception as e:
+    print(f"Gagal memuat data: {e}")
+    # Fallback jika butuh key spesifik
+    df = pd.read_hdf(path, key='data')
+
+# Pastikan waktu menjadi index
+if 'Time' in df.columns:
+    df['Time'] = pd.to_datetime(df['Time'])
+    df = df.sort_values('Time').set_index('Time')
+
+print("Dataset shape:", df.shape)
+
+df.info()
+
+df.head(15)
+
+df.shape
+
+print("duplicate rows:", df.duplicated().sum())
+print("Missing values:", df.isnull().sum().sum())
+
+selected_cols = [
+    'B.RTD6','WS1_Solar_radiation',
+    'WS1_Temperature','pid.SB47.setpoint',
+    'JP41_volumeFlow'
+]
+selected_cols = [c for c in selected_cols if c in df.columns]
+
+print("\n=== STATISTIK DESKRIPTIF ===")
+display(df[selected_cols].describe())
+
+sns.set_theme(style="whitegrid")
+
+#Distribusi Suhu Ruangan
+plt.figure(figsize=(8,4))
+sns.histplot(df['B.RTD6'], bins=40,kde=True, color='skyblue')
+plt.title("Distribusi Suhu Ruangan(B/TRD6)")
+plt.show()
+
+#Tren Waktu
+plt.figure(figsize=(14, 4))
+plt.plot(df.index, df['B.RTD6'], color='coral', linewidth=1)
+plt.title("Tren Fluktuasi Suhu Ruangan B.RTD6 Fase 5")
+plt.xlabel("Waktu")
+plt.ylabel("Suhu (°C)")
+plt.show()
+
+# Boxplot Outlier
+plt.figure(figsize=(8,2))
+sns.boxplot(x=df['B.RTD6'], color='lightgreen')
+plt.title("Boxplot Outlier")
+plt.show()
+
+#Profil Suhu Berdasarkan Jam (Domain Knowledge HVAC)
+df_eda = df.copy()
+df_eda['Hour'] = df_eda.index.hour
+plt.figure(figsize=(12,4))
+sns.boxplot(x='Hour', y='B.RTD6', data=df_eda, palette='coolwarm')
+plt.title("Profil Pola Suhu Ruangan Berdasarkan Jam dalam Sehari")
+plt.xlabel("Jam (0-23)")
+plt.ylabel("Suhu (°C)")
+plt.show()
+
+#korelasi fitur internal vs eksternal
+plt.figure(figsize=(12,4))
+sns.heatmap(df[selected_cols].corr(), annot=True, cmap='coolwarm', fmt=".2f")
+plt.title("Korelasi Fitur Internal vs Eksternal")
+plt.show()
+
+# 1. Filter data khusus saat radiasi matahari bernilai 0
+df_matahari_nol = df[df['WS1_Solar_radiation'] == 0]
+
+# 2. Ambil informasi 'Jam' dari index waktu, lalu hitung frekuensinya
+jam_kejadian = df_matahari_nol.index.hour.value_counts().sort_index()
+
+print("Distribusi kejadian Radiasi Matahari = 0 berdasarkan Jam:")
+print("-" * 50)
+for jam, jumlah in jam_kejadian.items():
+    print(f"Jam {jam:02d}:00  -->  Terjadi {jumlah} kali")
+
+print("-" * 50)
+print("Daftar unik jamnya:", sorted(df_matahari_nol.index.hour.unique()))
+
+df = df.drop_duplicates()
+
+# 1. Hapus kolom statis (JP41_volumeFlow akan terhapus di sini)
+static_cols = df.nunique()[df.nunique()==1].index
+df = df.drop(columns=static_cols)
+
+# 2. PENGAMAN: Update selected_cols agar hanya memanggil yang MASIH ADA di df
+selected_cols = [c for c in selected_cols if c in df.columns]
+
+# 3. Sekarang baru aman difilter
+df = df[selected_cols]
+
+# 4. Interpolasi & Filter Suhu (Lanjutkan seperti biasa)
+df = df.interpolate(method='time', limit_direction='both')
+df = df[(df['B.RTD6'] >= 5) & (df['B.RTD6'] <= 45)]
+
+print("Data berhasil dibersihkan! Sisa kolom:", df.columns.tolist())
+
+# ALASAN: Membuat fitur "masa lalu" (lag) agar model bisa memahami jeda waktu (delay)
+# dari panas matahari menuju kenaikan suhu ruangan. Target diset 30 menit ke depan.
+
+lags = [1, 5, 10, 15, 30]
+for lag in lags:
+    df[f'lag_temp_{lag}'] = df['B.RTD6'].shift(lag)
+
+df['target'] = df['B.RTD6'].shift(-30)
+
+# Menghapus NaN yang muncul di awal dan akhir akibat proses pergeseran waktu (shift)
+df = df.dropna()
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# 1. Menghitung matriks korelasi
+corr_matrix = df.corr()
+
+# 2. Mengatur ukuran gambar
+plt.figure(figsize=(12, 10))
+
+# 3. Membuat Heatmap
+# cmap='RdYlGn' memberikan warna Hijau untuk korelasi positif dan Merah untuk negatif
+sns.heatmap(corr_matrix, annot=True, cmap='RdYlGn', center=0, fmt='.2f', linewidths=0.5)
+
+plt.title('Heatmap Korelasi: Hubungan Fitur terhadap Target (30 Menit ke Depan)', fontsize=15)
+plt.show()
+
+# 4. Menampilkan urutan fitur yang paling berpengaruh terhadap Target
+print("\n=== URUTAN FITUR PALING BERPENGARUH TERHADAP TARGET ===")
+print(corr_matrix['target'].sort_values(ascending=False))
+
+# ALASAN: Data waktu TIDAK BOLEH diacak (no shuffle). 80% data awal untuk belajar,
+# 20% data akhir untuk ujian.
+
+features = [c for c in df.columns if c != 'target']
+split = int(len(df) * 0.8)
+
+train = df.iloc[:split]
+test  = df.iloc[split:]
+
+X_train, y_train = train[features], train['target']
+X_test,  y_test  = test[features],  test['target']
+
+plt.figure(figsize=(15, 5))
+plt.plot(df.index, df['B.RTD6'], label='Original Data', color='gray', alpha=0.7)
+plt.plot(train.index, train['B.RTD6'], label='Train Set', color='blue')
+plt.plot(test.index, test['B.RTD6'], label='Test Set', color='red')
+plt.axvline(x=train.index[-1], color='purple', linestyle='--', label='Split Point')
+plt.title('Visualisasi Pembagian Data Training dan Testing')
+plt.xlabel('Waktu')
+plt.ylabel('Suhu B.RTD6')
+plt.legend()
+plt.show()
+
+import matplotlib.pyplot as plt
+
+# Menghitung jumlah baris
+train_count = len(X_train)
+test_count = len(X_test)
+
+# Visualisasi Bar Chart
+plt.figure(figsize=(8, 5))
+labels = ['Train Set', 'Test Set']
+counts = [train_count, test_count]
+colors = ['blue', 'red']
+
+bars = plt.bar(labels, counts, color=colors, alpha=0.7)
+
+# Menambahkan label angka di atas bar
+for bar in bars:
+    yval = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2, yval + 100, f'{int(yval)}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+
+plt.title('Perbandingan Jumlah Sampel (Baris) Train vs Test')
+plt.ylabel('Jumlah Baris Data')
+plt.ylim(0, max(counts) * 1.2)
+plt.grid(axis='y', linestyle='--', alpha=0.6)
+plt.show()
+
+print(f"Total Data Training: {train_count} baris")
+print(f"Total Data Testing: {test_count} baris")
+
+epsilon = 1e-6
+baseline_pred = test['B.RTD6'] # Tebakan: Suhu saat ini
+
+baseline_mae = mean_absolute_error(y_test, baseline_pred)
+baseline_rmse = np.sqrt(mean_squared_error(y_test, baseline_pred))
+baseline_mape = np.mean(np.abs((y_test - baseline_pred)/(y_test+epsilon)))*100
+baseline_acc = 100 - baseline_mape
+
+print(f" Baseline MAE: {baseline_mae:.4f} °C")
+print(f" Baseline Accuracy: {baseline_acc:.2f}%")
+
+models = {
+    'Linear': Pipeline([('scaler', StandardScaler()), ('model', LinearRegression())]),
+    'Ridge': Pipeline([('scaler', StandardScaler()), ('model', Ridge())]),
+    'Tree': DecisionTreeRegressor(random_state=42),
+    'RF': RandomForestRegressor(random_state=42, n_jobs=-1),
+    'GB': GradientBoostingRegressor(random_state=42),
+    'XGB': XGBRegressor(random_state=42, objective='reg:squarederror', n_jobs=-1)
+}
+
+results = []
+
+for name, model in models.items():
+    model.fit(X_train, y_train)
+    pred = model.predict(X_test)
+
+    mae = mean_absolute_error(y_test, pred)
+    rmse = np.sqrt(mean_squared_error(y_test, pred))
+    mape = np.mean(np.abs((y_test - pred)/(y_test+epsilon)))*100
+    acc = 100 - mape
+
+    results.append([name, mae, rmse, acc])
+
+results_df = pd.DataFrame(results, columns=["Model", "MAE", "RMSE", "Forecast_Accuracy"])
+results_df = results_df.sort_values("MAE")
+
+# Visualisasi Peringkat Model
+plt.figure(figsize=(8,4))
+sns.barplot(data=results_df, x="Model", y="MAE", palette="viridis")
+plt.title("Perbandingan Error (MAE) Antar Model - Makin Kecil Makin Baik")
+plt.show()
+
+display(results_df)
+
+
+
+from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV, ParameterGrid
+import numpy as np
+from sklearn.metrics import mean_absolute_error
+
+# ==============================================================================
+# 🔹 8. HYPERPARAMETER TUNING (TOP 4)
+# ==============================================================================
+# ALASAN: Menghemat waktu komputasi dengan memeras potensi 4 model terbaik.
+# Digunakan TimeSeriesSplit agar proses validasi tidak membocorkan data masa depan.
+
+top4 = results_df["Model"].values[:4]
+print("\nTop 4 Models untuk di-Tuning:", top4)
+
+param_grid = {
+    'RF': {'n_estimators': [100, 200], 'max_depth': [10, 20, None]},
+    'GB': {'n_estimators': [100, 200], 'learning_rate': [0.05, 0.1]},
+    'XGB': {'n_estimators': [100, 200], 'learning_rate': [0.05, 0.1]},
+    'Ridge': {'model__alpha': [0.1, 1, 10]}
+}
+
+tscv = TimeSeriesSplit(n_splits=3)
+best_model = None
+best_score = np.inf
+best_name = ""
+
+for name in top4:
+    model = models[name]
+    grid = param_grid.get(name)
+
+    if grid:
+        # LOGIKA AMAN: Mencegah error jika kombinasi parameter (seperti Ridge) terlalu sedikit
+        max_kombinasi = len(ParameterGrid(grid))
+        n_iter_aman = min(5, max_kombinasi)
+
+        search = RandomizedSearchCV(
+            model, grid, n_iter=n_iter_aman,
+            scoring='neg_mean_absolute_error',
+            cv=tscv, n_jobs=-1, random_state=42
+        )
+        search.fit(X_train, y_train)
+        model_terbaik_sementara = search.best_estimator_
+        print(f"[{name}] Selesai Tuning. Parameter Terbaik: {search.best_params_}")
+    else:
+        # Bagian ini sangat jenius! Ini akan otomatis menangani model 'Linear'
+        # yang memang tidak punya parameter kompleks di param_grid.
+        model.fit(X_train, y_train)
+        model_terbaik_sementara = model
+        print(f"[{name}] Selesai (Tanpa Tuning Parameter).")
+
+    pred = model_terbaik_sementara.predict(X_test)
+    mae = mean_absolute_error(y_test, pred)
+
+    if mae < best_score:
+        best_score = mae
+        best_model = model_terbaik_sementara
+        best_name = name
+
+print("\n==================================================")
+print(f"🏆 MODEL FINAL JUARA: {best_name} dengan MAE: {best_score:.4f} °C")
+print("==================================================")
+
+# ==============================================================================
+# 🔹 9. VISUALISASI HASIL AKHIR (PEMBUKTIAN SANG JUARA)
+# ==============================================================================
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+# 1. Gunakan best_model (Ridge) untuk menebak seluruh data Test
+final_predictions = best_model.predict(X_test)
+
+# 2. Susun ke dalam DataFrame agar mudah di-plot
+df_result = pd.DataFrame({
+    'Waktu': y_test.index,
+    'Suhu Asli': y_test.values,
+    'Prediksi Ridge': final_predictions
+}).set_index('Waktu')
+
+# ------------------------------------------------------------------------------
+# GRAFIK 1: Line Plot (Kita zoom di 500 menit terakhir agar bentuknya terlihat jelas)
+# ------------------------------------------------------------------------------
+plt.figure(figsize=(14, 6))
+# Ambil 500 data terakhir agar grafik tidak terlalu padat
+zoom_asli = df_result['Suhu Asli'].iloc[-500:]
+zoom_pred = df_result['Prediksi Ridge'].iloc[-500:]
+
+plt.plot(zoom_asli.index, zoom_asli, label='Suhu Asli (Aktual)', color='royalblue', linewidth=2)
+plt.plot(zoom_pred.index, zoom_pred, label='Tebakan Model (Ridge)', color='darkorange', linestyle='--', linewidth=2)
+
+plt.title('Pergerakan Suhu Asli vs Prediksi (Zoom 500 Menit Terakhir)', fontsize=14, fontweight='bold')
+plt.xlabel('Waktu')
+plt.ylabel('Suhu B.RTD6 (°C)')
+plt.legend(loc='upper right')
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.show()
+
+# ------------------------------------------------------------------------------
+# GRAFIK 2: Scatter Plot (Linearitas Prediksi)
+# ------------------------------------------------------------------------------
+plt.figure(figsize=(7, 7))
+sns.scatterplot(x='Suhu Asli', y='Prediksi Ridge', data=df_result, alpha=0.4, color='teal')
+
+# Buat garis merah diagonal (Garis Kesempurnaan)
+min_val = min(df_result['Suhu Asli'].min(), df_result['Prediksi Ridge'].min())
+max_val = max(df_result['Suhu Asli'].max(), df_result['Prediksi Ridge'].max())
+plt.plot([min_val, max_val], [min_val, max_val], color='red', linestyle='-', linewidth=2, label='Prediksi Sempurna')
+
+plt.title('Sebaran Akurasi: Suhu Asli vs Prediksi Ridge', fontsize=14, fontweight='bold')
+plt.xlabel('Suhu Asli (°C)')
+plt.ylabel('Prediksi Model (°C)')
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.show()
+
+final_pred = best_model.predict(X_test)
+
+final_mae = mean_absolute_error(y_test, final_pred)
+final_rmse = np.sqrt(mean_squared_error(y_test, final_pred))
+final_mape = np.mean(np.abs((y_test - final_pred)/(y_test+epsilon)))*100
+final_acc = 100 - final_mape
+
+print("="*40)
+print(f" FINAL MAE      : {final_mae:.4f} °C")
+print(f" FINAL RMSE     : {final_rmse:.4f} °C")
+print(f" FINAL ACCURACY : {final_acc:.2f}%")
+print("="*40)
+
+# Plot: Baseline vs Final AI
+plt.figure(figsize=(5,4))
+plt.bar(["Baseline Naive", f"Final ({best_name})"], [baseline_mae, final_mae], color=['gray', 'green'])
+plt.title("Penurunan Error: AI vs Tebakan Biasa")
+plt.ylabel("Error (MAE)")
+plt.show()
+
+# Plot: Garis Waktu Aktual vs Prediksi AI (Ambil 400 menit sampel)
+plt.figure(figsize=(14,4))
+plt.plot(y_test.index[:400], y_test.values[:400], label="Suhu Aktual (Realita)", color="blue")
+plt.plot(y_test.index[:400], final_pred[:400], label="Prediksi AI", color="red", linestyle="--")
+plt.title(f"Suhu Asli vs Prediksi {best_name} (Horizon 30 Menit)")
+plt.legend()
+plt.show()
+
+
+def smart_hvac_controller(predicted_temp):
+    if predicted_temp > 24.5:
+        return "Matikan Pemanas (Mencegah Overheating)"
+    elif predicted_temp < 20:
+        return "Nyalakan Pemanas (Menjaga Kenyamanan)"
+    else:
+        return "Standby (Suhu Optimal)"
+
+# Contoh jalannya sistem pada menit ke-100 di data testing
+idx_sampel = 100
+sample_pred = final_pred[idx_sampel]
+waktu_kejadian = y_test.index[idx_sampel].strftime('%Y-%m-%d %H:%M')
+
+print("\n🚀 --- SIMULASI SISTEM KONTROL GEDUNG PINTAR --- 🚀")
+print(f"Waktu Sistem     : {waktu_kejadian}")
+print(f"Prediksi Suhu 30m: {sample_pred:.2f} °C")
+print(f"Tindakan Otomatis: {smart_hvac_controller(sample_pred)}")
+
+
+import pandas as pd
+
+# 1. Logika Pengontrol HVAC
+def smart_hvac_controller(predicted_temp):
+    if predicted_temp > 24.5:
+        return "Matikan Pemanas (Mencegah Overheating)"
+    elif predicted_temp < 20:
+        return "Nyalakan Pemanas (Menjaga Kenyamanan)"
+    else:
+        return "Standby (Suhu Optimal)"
+
+# 2. Pilih satu sampel dari data Ujian (Test Set)
+idx_sampel = 100
+
+# ==========================================================
+# 🔹 VARIABEL WAKTU & SUHU SAAT INI (Waktu T)
+# ==========================================================
+waktu_sekarang = y_test.index[idx_sampel]
+suhu_sekarang = X_test.iloc[idx_sampel]['B.RTD6'] # Suhu asli saat itu
+
+# ==========================================================
+# 🔹 VARIABEL WAKTU & SUHU MASA DEPAN (Waktu T + 30 Menit)
+# ==========================================================
+# Menghitung jam berapa tepatnya 30 menit kemudian
+waktu_target = waktu_sekarang + pd.Timedelta(minutes=30)
+
+sample_pred = final_pred[idx_sampel]     # Tebakan AI untuk 30 menit lagi
+sample_aktual = y_test.iloc[idx_sampel]  # Fakta sebenarnya 30 menit lagi
+selisih = abs(sample_pred - sample_aktual)
+
+# 3. Tampilkan Laporan Simulasi
+print("\n🚀 --- SIMULASI SISTEM KONTROL GEDUNG PINTAR --- 🚀")
+print("📍 [KONDISI SAAT INI]")
+print(f"Waktu Sistem      : {waktu_sekarang.strftime('%Y-%m-%d %H:%M')}")
+print(f"Suhu Ruangan Kini : {suhu_sekarang:.2f} °C")
+
+print("\n🔮 [PREDIKSI 30 MENIT KE DEPAN]")
+print(f"Target Jam Berapa : {waktu_target.strftime('%Y-%m-%d %H:%M')}")
+print("-" * 45)
+print(f"Tebakan AI        : {sample_pred:.2f} °C")
+print(f"Fakta Sebenarnya  : {sample_aktual:.2f} °C")
+print(f"Selisih (Error)   : {selisih:.2f} °C")
+print("-" * 45)
+print(f"Tindakan Otomatis : {smart_hvac_controller(sample_pred)}")
+
+timestamp_target = '2024-05-16 08:23'
+# Mencari data pada timestamp tersebut
+try:
+    target_data = df.loc[timestamp_target]
+    print(f"--- DATA PADA {timestamp_target} ---")
+    print(target_data)
+except KeyError:
+    print(f"Data pada waktu {timestamp_target} tidak ditemukan.")
+
+timestamp_target = '2024-05-16 08:53'
+# Mencari data pada timestamp tersebut
+try:
+    target_data = df.loc[timestamp_target]
+    print(f"--- DATA PADA {timestamp_target} ---")
+    print(target_data)
+except KeyError:
+    print(f"Data pada waktu {timestamp_target} tidak ditemukan.")
+
+joblib.dump(best_model, "model_rico_final.pkl")
+print("\n✅ Model berhasil disimpan sebagai 'model_rico_final.pkl'. Proyek Selesai!")
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# ==========================================================
+# 🔹 1. PERSIAPAN MODEL & LOGIKA (PASTIKAN SUDAH RUN TRAINING)
+# ==========================================================
+# Menggunakan best_model hasil tuning Ridge yang paling presisi
+model_hvac = best_model
+
+def smart_hvac_controller(predicted_temp):
+    """Logika Pengambil Keputusan HVAC Otomatis"""
+    if predicted_temp > 24.5:
+        return "🔴 Matikan Pemanas (Mencegah Overheating)"
+    elif predicted_temp < 20:
+        return "🔵 Nyalakan Pemanas (Menjaga Kenyamanan)"
+    else:
+        return "🟢 Standby (Suhu Optimal)"
+
+# ==========================================================
+# 🔹 2. INPUT MANUAL (WAKTU & SENSOR)
+# ==========================================================
+print("=== 🧠 SIMULASI MANUAL SMART BUILDING AI (ENERLOOP) ===")
+print("Silakan masukkan data sesuai skenario yang ingin diuji.")
+print("-" * 50)
+
+try:
+    # --- INPUT WAKTU ---
+    waktu_str = input("1. Masukkan Waktu (YYYY-MM-DD HH:MM, contoh 2026-03-01 13:00): ")
+    waktu_sekarang = datetime.strptime(waktu_str, '%Y-%m-%d %H:%M')
+
+    # --- INPUT SENSOR UTAMA ---
+    temp_now = float(input("2. Suhu Ruangan Saat Ini (°C): "))
+    solar    = float(input("3. Intensitas Matahari (W/m²): "))
+    temp_out = float(input("4. Suhu Luar Gedung (°C): "))
+    setpoint = float(input("5. Setpoint HVAC (Gunakan 40 jika ragu): ") or 40)
+
+    # --- INPUT PEMBANDING ---
+    fakta_nanti = float(input("6. Fakta Suhu 30 Menit Lagi (°C) [untuk cek error]: "))
+
+    # ==========================================================
+    # 🔹 3. PENGOLAHAN DATA OLEH AI
+    # ==========================================================
+    # AI butuh 9 kolom input sesuai urutan training:
+    # [B.RTD6, WS1_Solar_radiation, WS1_Temperature, pid.SB47.setpoint,
+    #  lag_temp_1, lag_temp_5, lag_temp_10, lag_temp_15, lag_temp_30]
+
+    # Untuk demo manual titik tunggal, kita asumsikan kondisi awal stabil
+    # (nilai lag = suhu saat ini) agar AI bisa memproses input.
+    input_data = pd.DataFrame([[
+        temp_now, solar, temp_out, setpoint,
+        temp_now, temp_now, temp_now, temp_now, temp_now
+    ]], columns=X_train.columns)
+
+    # Prediksi Otomatis
+    prediksi_ai = model_hvac.predict(input_data)[0]
+
+    # Hitung Waktu Target & Error
+    waktu_target = waktu_sekarang + pd.Timedelta(minutes=30)
+    selisih_error = abs(prediksi_ai - fakta_nanti)
+
+    # ==========================================================
+    # 🔹 4. LAPORAN HASIL SIMULASI
+    # ==========================================================
+    print("\n" + "="*55)
+    print("🚀 --- LAPORAN PREDIKSI OTOMATIS ENERLOOP AI --- 🚀")
+    print(f"Waktu Sistem Input : {waktu_sekarang.strftime('%Y-%m-%d %H:%M')}")
+    print(f"Target Jam Prediksi: {waktu_target.strftime('%H:%M')} (30 Menit ke Depan)")
+    print("-" * 55)
+    print(f"Suhu Ruangan Kini  : {temp_now:.2f} °C")
+    print(f"TEBAKAN AI (30m)   : {prediksi_ai:.2f} °C 👈 (Hasil Otomatis)")
+    print(f"Fakta Sebenarnya   : {fakta_nanti:.2f} °C")
+    print(f"Akurasi Error      : {selisih_error:.4f} °C")
+    print("-" * 55)
+    print(f"TINDAKAN OTOMATIS  : {smart_hvac_controller(prediksi_ai)}")
+    print("="*55)
+
+except ValueError:
+    print("\n❌ Error: Format salah! Pastikan waktu (YYYY-MM-DD HH:MM) dan angka suhu benar.")
+except Exception as e:
+    print(f"\n❌ Terjadi Kesalahan: {e}")
+
+# Asumsi 'df' adalah dataframe yang sudah berisi fitur lag
+df.to_csv('data_B.RTD6_Clean.csv', index=True)
+
+
