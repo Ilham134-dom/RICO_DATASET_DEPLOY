@@ -141,6 +141,10 @@ with tab1:
 
     else:
         uploaded_file = st.file_uploader("Upload File CSV Anda", type=['csv'])
+        
+        st.caption("📌 **Penting:** Pastikan file CSV Anda memiliki 9 fitur wajib berikut agar AI dapat bekerja:")
+        st.code("B.RTD6, WS1_Solar_radiation, WS1_Temperature, pid.SB47.setpoint, lag_temp_1, lag_temp_5, lag_temp_10, lag_temp_15, lag_temp_30", language="text")
+        
         if uploaded_file is not None:
             df_custom = pd.read_csv(uploaded_file)
             df_custom = process_time_index(df_custom)
