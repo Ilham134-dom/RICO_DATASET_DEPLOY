@@ -7,7 +7,7 @@ import os
 # ==========================================
 # 1. KONFIGURASI & CSS HALAMAN
 # ==========================================
-st.set_page_config(page_title="Enerloop HVAC Predictor", page_icon="🏢", layout="wide")
+st.set_page_config(page_title="HVAC Predictor", page_icon="🏢", layout="wide")
 
 st.markdown("""
 <style>
@@ -76,7 +76,7 @@ FITUR_AI = ['B.RTD6', 'WS1_Solar_radiation', 'WS1_Temperature', 'pid.SB47.setpoi
 # ==========================================
 # 3. HEADER APLIKASI
 # ==========================================
-st.title("🏢 Smart Building HVAC Predictor - ENERLOOP AI")
+st.title("🏢 Smart Building HVAC Predictor")
 st.markdown("Mensimulasikan sistem kontrol gedung pintar berbasis Machine Learning untuk memprediksi inersia termal 30 menit ke depan.")
 st.divider()
 
@@ -182,7 +182,7 @@ with tab1:
                         
                     st.markdown(f"### 🤖 Tindakan HVAC Otomatis: {smart_hvac_controller(prediksi_ai)}")
                 except KeyError:
-                    st.error("❌ File CSV yang diupload tidak memiliki 9 kolom fitur yang dibutuhkan model Enerloop!")
+                    st.error("❌ File CSV yang diupload tidak memiliki 9 kolom fitur yang dibutuhkan model!")
             
             # --- PERBAIKAN GRAFIK TAB 1 ---
             st.markdown("---")
